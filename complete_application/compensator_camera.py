@@ -1,8 +1,13 @@
 import cv2
 import numpy as np
 
+
 class CameraMotionCompensator:
-    """ORB-based camera motion compensator using a reference frame."""
+    """ORB-based camera motion compensator using a reference frame.
+
+    It estimates a homography H that maps current frame coordinates
+    into the reference frame coordinates.
+    """
 
     def __init__(self, ref_frame, floor_mask=None,
                  n_features=800, ratio_thresh=0.75, ransac_thresh=3.0):
@@ -25,6 +30,7 @@ class CameraMotionCompensator:
         return kp, des
 
     def update(self, frame, mask):
+        """Update homography H(current -> reference) using ORB matches."""
         cur_kp, cur_des = self._detect(frame, mask)
         if cur_des is None or self.ref_des is None:
             return self.H
@@ -35,8 +41,8 @@ class CameraMotionCompensator:
         if len(good) < 4:
             return self.H
 
-        src = np.float32([cur_kp[m.queryIdx].pt for m in good]).reshape(-1,1,2)
-        dst = np.float32([self.ref_kp[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+        src = np.float32([cur_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([self.ref_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
         H, _ = cv2.findHomography(src, dst, cv2.RANSAC, self.ransac)
         if H is not None:
@@ -45,6 +51,7 @@ class CameraMotionCompensator:
         return self.H
 
     def warp_point(self, u, v):
+        """Warp a point (u,v) from current frame to reference frame."""
         pt = np.array([[[u, v]]], dtype=np.float32)
         out = cv2.perspectiveTransform(pt, self.H)
-        return float(out[0,0,0]), float(out[0,0,1])
+        return float(out[0, 0, 0]), float(out[0, 0, 1])
