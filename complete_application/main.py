@@ -1,4 +1,5 @@
 import csv
+import math
 from collections import deque
 
 import cv2
@@ -51,10 +52,16 @@ def main():
     # Kalman filter and trajectory trail in image space
     kalman = None
     trail_image = deque(maxlen=cfg.MAX_TRAIL_LENGTH)
-    last_radius_px = None  # last known radius, used when detection is missing
+    last_radius_px = None  # last known radius, used for drawing
+    last_center = None     # last measured center (x, y)
 
     # Trajectory trail in top-view (ground plane, camera-motion compensated)
     trail_topview = deque(maxlen=cfg.MAX_TRAIL_LENGTH)
+
+    # Ground-plane positions for static/moving classification
+    ground_history = deque()  # stores (t_sec, Xg, Zg)
+    missing_ground_frames = 0
+    ball_is_static = False
 
     floor_mask = None
     floor_poly_pts = None
@@ -91,8 +98,6 @@ def main():
 
         # Initialize intrinsics once we know working resolution
         if fx_scaled is None:
-            # Use provided FX_NATIVE/FY_NATIVE as approximate focal lengths in pixels.
-            # If the video was not recorded at the same resolution, scale them accordingly.
             if cfg.TARGET_WIDTH is not None:
                 scale_factor = w / float(cfg.TARGET_WIDTH)
             else:
@@ -105,7 +110,6 @@ def main():
                 cx_used = cfg.CX_NATIVE * scale_factor
                 cy_used = cfg.CY_NATIVE * scale_factor
             else:
-                # Fallback: principal point at image center (from video metadata).
                 cx_used = w / 2.0
                 cy_used = h / 2.0
 
@@ -116,29 +120,21 @@ def main():
         # Floor mask (ROI) – compute once, in reference frame coordinates
         if cfg.USE_FLOOR_MASK and floor_mask is None:
             floor_mask, floor_poly_pts = create_floor_mask_and_polygon(frame.shape)
-            # Build homography from image (reference frame) to metric ground plane
             H_img2ground = compute_ground_homography(floor_poly_pts)
             if H_img2ground is None:
                 print("[WARN] Could not compute ground homography. Top-view will be disabled.")
             else:
                 print("[INFO] Ground homography (image -> ground) initialized.")
 
-        # Initialize Kalman filter once (we need dt)
-        if kalman is None:
-            kalman = create_kalman_filter(dt)
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # ------------------- Camera Motion Estimation -------------------
         if frame_idx == 0:
-            # First frame: detect background features, restricted to floor to
-            # stay on the dominant plane (ground).
             feat_mask = floor_mask if cfg.USE_FLOOR_MASK else None
             prev_gray = gray.copy()
             prev_pts = detect_features(prev_gray, mask=feat_mask)
         else:
             prev_gray, prev_pts, H_global = update_camera_motion(prev_gray, prev_pts, gray, H_global)
-            # If we ran out of points, re-detect on the current frame.
             if prev_pts is None or len(prev_pts) < 50:
                 feat_mask = floor_mask if cfg.USE_FLOOR_MASK else None
                 prev_pts = detect_features(gray, mask=feat_mask)
@@ -146,46 +142,56 @@ def main():
 
         # ------------------- 2D Detection -------------------
         red_mask = get_red_mask(frame)
-
-        # Limit search to floor if enabled
         if cfg.USE_FLOOR_MASK and floor_mask is not None:
             red_mask = cv2.bitwise_and(red_mask, floor_mask)
 
         detected_circle = find_red_ball(red_mask, frame.shape)
-
         t_sec = frame_idx / fps
-
-        # ------------------- Kalman Tracking -------------------
-        # Predict step
-        predicted_state = kalman.predict()
-        pred_x, pred_y = float(predicted_state[0]), float(predicted_state[1])
-
         has_measurement = detected_circle is not None
 
+        # ------------------- Kalman Tracking (ONLY with measurement) -------------------
         if has_measurement:
             meas_x, meas_y, meas_r = detected_circle
-            measurement = np.array([[np.float32(meas_x)],
-                                    [np.float32(meas_y)]], dtype=np.float32)
-            corrected_state = kalman.correct(measurement)
-            x_track = float(corrected_state[0])
-            y_track = float(corrected_state[1])
+
+            if kalman is None:
+                kalman = create_kalman_filter(dt)
+                # initialize state with first measurement
+                kalman.statePost = np.array([[meas_x],
+                                             [meas_y],
+                                             [0.0],
+                                             [0.0]], dtype=np.float32)
+                x_track = float(meas_x)
+                y_track = float(meas_y)
+            else:
+                kalman.predict()
+                measurement = np.array([[np.float32(meas_x)],
+                                        [np.float32(meas_y)]], dtype=np.float32)
+                corrected_state = kalman.correct(measurement)
+                x_track = float(corrected_state[0, 0])
+                y_track = float(corrected_state[1, 0])
+
             last_radius_px = meas_r
+            last_center = (x_track, y_track)
         else:
-            # No detection: rely purely on prediction
-            x_track = pred_x
-            y_track = pred_y
+            # No detection: do NOT run Kalman; just keep last center (or None)
+            if last_center is not None:
+                x_track, y_track = last_center
+            else:
+                x_track, y_track = None, None
 
         # Visualization: tracked center + last valid radius
-        if last_radius_px is None:
-            vis_radius = 10
+        if last_radius_px is None or x_track is None or y_track is None:
+            tracked_circle = None
         else:
-            vis_radius = last_radius_px
-
-        tracked_circle = (int(round(x_track)), int(round(y_track)), int(round(vis_radius)))
+            tracked_circle = (
+                int(round(x_track)),
+                int(round(y_track)),
+                int(round(last_radius_px))
+            )
 
         # ------------------- 3D Estimation (for CSV and overlay only) -------------------
-        if last_radius_px is not None:
-            circle_for_3d = (x_track, y_track, last_radius_px)
+        if tracked_circle is not None:
+            circle_for_3d = (tracked_circle[0], tracked_circle[1], last_radius_px)
             result_3d = compute_3d_position_from_circle(
                 circle_for_3d,
                 fx_scaled,
@@ -205,8 +211,12 @@ def main():
             overlay_text = None
 
         # ------------------- Trajectory trail in image space -------------------
-        if 0 <= x_track < w and 0 <= y_track < h:
-            trail_image.append((int(round(x_track)), int(round(y_track))))
+        if tracked_circle is not None:
+            tx, ty, _ = tracked_circle
+            if 0 <= tx < w and 0 <= ty < h:
+                trail_image.append((tx, ty))
+            else:
+                trail_image.append(None)
         else:
             trail_image.append(None)
 
@@ -215,18 +225,17 @@ def main():
         xs_stab = ys_stab = None
         Xg = Zg = None
 
-        if H_global is not None and H_img2ground is not None:
-            # Stabilize tracked point to reference frame (remove camera motion)
-            stab_result = stabilize_point(x_track, y_track, H_global)
+        if tracked_circle is not None and H_global is not None and H_img2ground is not None:
+            tx, ty, _ = tracked_circle
+
+            stab_result = stabilize_point(tx, ty, H_global)
             if stab_result is not None:
                 xs_stab, ys_stab = stab_result
 
-                # Project stabilized point to ground plane (metric coordinates)
                 ground_result = image_to_ground(xs_stab, ys_stab, H_img2ground)
                 if ground_result is not None:
                     Xg, Zg = ground_result
 
-                    # Map ground coordinates to top-view pixels
                     u, v = world_to_topview(Xg, Zg)
                     if 0 <= u < cfg.TOPVIEW_WIDTH and 0 <= v < cfg.TOPVIEW_HEIGHT:
                         current_topview_point = (u, v)
@@ -240,18 +249,41 @@ def main():
         else:
             trail_topview.append(None)
 
+        # ------------------- Static / Dynamic classification in ground plane -------------------
+        if Xg is not None and Zg is not None and has_measurement:
+            ground_history.append((t_sec, Xg, Zg))
+            missing_ground_frames = 0
+
+            # drop old points outside the time window
+            while ground_history and (t_sec - ground_history[0][0]) > cfg.STATIC_WINDOW_SEC:
+                ground_history.popleft()
+        else:
+            missing_ground_frames += 1
+            if missing_ground_frames > int(fps * cfg.STATIC_WINDOW_SEC):
+                ground_history.clear()
+
+        if len(ground_history) >= 2:
+            t0, X0, Z0 = ground_history[0]
+            tn, Xn, Zn = ground_history[-1]
+            dt_hist = max(tn - t0, 1e-6)
+            dist_hist = math.hypot(Xn - X0, Zn - Z0)
+            speed_hist = dist_hist / dt_hist
+            ball_is_static = (
+                dist_hist < cfg.STATIC_DIST_THRESHOLD_M
+                and speed_hist < cfg.STATIC_SPEED_THRESHOLD_MS
+            )
+        else:
+            ball_is_static = False
+
         # ------------------- Visualization: RGB + Trajectory -------------------
         vis_frame = frame.copy()
 
-        # ROI contour (terrace)
         if cfg.USE_FLOOR_MASK and floor_poly_pts is not None:
             cv2.polylines(vis_frame, [floor_poly_pts], isClosed=True,
                           color=(255, 0, 0), thickness=2)
 
-        # Draw ball (tracked) with text
         vis_frame = draw_ball_2d_overlay(vis_frame, tracked_circle, text=overlay_text)
 
-        # Draw image-space trajectory (2D in pixel coords)
         vis_frame = draw_trajectory(
             vis_frame,
             trail_image,
@@ -259,27 +291,14 @@ def main():
             max_trail_length=cfg.MAX_TRAIL_LENGTH
         )
 
-        # If we had an actual detection this frame, mark measurement in green
+        # If we had a measurement this frame, mark the measurement center in green
         if has_measurement and detected_circle is not None:
             mx, my, _ = detected_circle
             cv2.circle(vis_frame, (mx, my), 4, (0, 255, 0), -1)
 
-        status_txt = "Tracking: M+P" if has_measurement else "Tracking: PRED ONLY"
-        cv2.putText(
-            vis_frame,
-            status_txt,
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
-
-        # ------------------- Visualization: Top-View (Ground, Camera-Motion Compensated) -------------------
+        # ------------------- Visualization: Top-View -------------------
         topview_frame = create_empty_topview_frame()
 
-        # Draw ground-plane trajectory (stabilized)
         topview_frame = draw_trajectory(
             topview_frame,
             trail_topview,
@@ -287,7 +306,6 @@ def main():
             max_trail_length=cfg.MAX_TRAIL_LENGTH
         )
 
-        # Draw current ball position on top-view
         if current_topview_point is not None:
             cv2.circle(topview_frame, current_topview_point, 6, (0, 0, 255), -1)
             cv2.putText(
@@ -312,8 +330,8 @@ def main():
         row = {
             "frame_idx": frame_idx,
             "time_s": t_sec,
-            "tracked_x_px": x_track,
-            "tracked_y_px": y_track,
+            "tracked_x_px": tracked_circle[0] if tracked_circle is not None else "",
+            "tracked_y_px": tracked_circle[1] if tracked_circle is not None else "",
             "radius_px": last_radius_px if last_radius_px is not None else "",
             "X_cam_m": X_cam if X_cam is not None else "",
             "Y_cam_m": Y_cam if Y_cam is not None else "",
@@ -324,6 +342,7 @@ def main():
             "stab_y_ref_px": ys_stab if ys_stab is not None else "",
             "X_ground_m": Xg if Xg is not None else "",
             "Z_ground_m": Zg if Zg is not None else "",
+            "ball_static": int(ball_is_static),
         }
         csv_rows.append(row)
 
@@ -342,7 +361,7 @@ def main():
         out_video_topview.release()
     cv2.destroyAllWindows()
 
-    # ------------------- Save CSV (Excel-friendly) -------------------
+    # ------------------- Save CSV -------------------
     fieldnames = [
         "frame_idx",
         "time_s",
@@ -358,6 +377,7 @@ def main():
         "stab_y_ref_px",
         "X_ground_m",
         "Z_ground_m",
+        "ball_static",
     ]
 
     with open(cfg.OUTPUT_CSV_PATH, mode="w", newline="") as f:

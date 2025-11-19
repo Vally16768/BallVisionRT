@@ -283,12 +283,11 @@ def compute_ground_homography(floor_poly_pts):
     src = floor_poly_pts.reshape(-1, 2).astype(np.float32)
 
     # Destination points in ground coords (X,Z), in meters.
-    # We map the terrace rectangle to [0,GROUND_WIDTH_M] x [0,GROUND_LENGTH_M].
     dst = np.array([
-        [0.0,              0.0],               # bottom-left
-        [cfg.GROUND_WIDTH_M,   0.0],               # bottom-right
-        [cfg.GROUND_WIDTH_M,   cfg.GROUND_LENGTH_M],   # top-right (far)
-        [0.0,              cfg.GROUND_LENGTH_M],   # top-left  (far)
+        [0.0,                0.0],                    # bottom-left
+        [cfg.GROUND_WIDTH_M, 0.0],                    # bottom-right
+        [cfg.GROUND_WIDTH_M, cfg.GROUND_LENGTH_M],    # top-right (far)
+        [0.0,                cfg.GROUND_LENGTH_M],    # top-left  (far)
     ], dtype=np.float32)
 
     H_img2ground, _ = cv2.findHomography(src, dst, method=0)

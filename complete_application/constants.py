@@ -62,3 +62,18 @@ CAMERA_PX = (TOPVIEW_WIDTH // 2, TOPVIEW_HEIGHT - 40)
 # Margins (for drawing the ground rectangle inside the top-view image)
 TOPVIEW_MARGIN_X = 80
 TOPVIEW_MARGIN_Y = 60
+
+# ============================================================
+# STATIC BALL DETECTION (GROUND PLANE)
+# ============================================================
+
+# Time window (seconds) over which we decide if the ball is static.
+STATIC_WINDOW_SEC = 1.0  # last 1 second
+
+# Maximum total displacement in ground plane within the window (meters)
+# to still consider the ball static.
+STATIC_DIST_THRESHOLD_M = 0.10  # 10 cm
+
+# Maximum average speed in ground plane within the window (meters/second)
+# to still consider the ball static.
+STATIC_SPEED_THRESHOLD_MS = 0.05  # 5 cm/s
