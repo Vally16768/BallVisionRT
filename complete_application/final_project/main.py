@@ -9,6 +9,7 @@ Steps:
   3) Build a floor template for camera motion tracking.
   4) For each video frame:
       - Track camera motion via template matching on the floor.
+      - Apply temporal smoothing on (dx, dy) to reduce jitter.
       - Warp the floor mask into the current frame.
       - Detect the red ball constrained to the floor.
       - Estimate its 3D position (X, Y, Z) and distance.
@@ -16,11 +17,17 @@ Steps:
       - Map both ball and camera into the top-view "world" coordinates.
       - Save debug videos and a CSV with positions and velocities.
 
+  5) After processing all frames:
+      - Group top-view ball points into separate runs (shots).
+      - For each run, fit a straight line and project all points on that line.
+      - Render a final stabilized top-view image with straightened trajectories.
+
 Outputs:
   - Ball detection video (per-frame detections).
   - Ball trajectory video (2D trajectory in image space).
-  - Top-view video (bird's-eye world map, ball path + camera path).
+  - Top-view video (bird's-eye world map, raw ball path + camera path).
   - CSV file with 3D positions and velocities.
+  - Final top-view PNG with straightened (stabilized) trajectories.
 """
 
 import csv
@@ -106,8 +113,8 @@ def main():
     th, tw = floor_template.shape[:2]
     print(f"[INFO] Floor template size: {tw}x{th} px")
 
-    # Top-view: start from the floor as static background (world map).
-    topview_accum = cv2.cvtColor(floor_topview0, cv2.COLOR_GRAY2BGR)
+    # Base image for top-view (static floor, no ball / camera yet)
+    topview_base = cv2.cvtColor(floor_topview0, cv2.COLOR_GRAY2BGR)
 
     # Estimate focal length and optical center (for ball 3D estimation)
     f_px = estimate_focal_length_pixels(w, D435I_RGB_HFOV_DEG)
@@ -131,14 +138,6 @@ def main():
     csv_file = open(OUTPUT_CSV, mode="w", newline="")
     csv_writer = csv.writer(csv_file)
 
-    # Column description:
-    # - frame_idx: frame index (integer).
-    # - time_s: absolute timestamp of the frame in seconds.
-    # - u_px, v_px, r_px: 2D image position and radius of the detected ball.
-    # - X_m, Y_m, Z_m: estimated 3D coordinates in camera space (meters).
-    # - distance_m: Euclidean distance from the camera to the ball (meters).
-    # - Vx_m_s, Vy_m_s, Vz_m_s: 3D velocity components (meters/second).
-    # - V_m_s: magnitude of the velocity (meters/second).
     csv_writer.writerow([
         "frame_idx", "time_s",
         "u_px", "v_px", "r_px",
@@ -149,14 +148,27 @@ def main():
     # ----------------------------------------------------------------------
     # Tracking state
     # ----------------------------------------------------------------------
-    trajectory_points = []  # ball trajectory in image space for visualization
+    trajectory_points = []  # ball trajectory in image space (for traj video)
     prev_ball = None        # previous (x, y, r) for temporal ball tracking
     prev_3d = None          # previous (X, Y, Z) for velocity estimation
     prev_t = None           # previous time in seconds
 
     frame_idx = 0
 
-    # Reset video to the beginning (we have already read frame0)
+    # Smoothed camera translation (to reduce jitter from template matching)
+    dx_smooth = 0.0
+    dy_smooth = 0.0
+    alpha = 0.9  # smoothing factor: closer to 1 => stronger smoothing
+
+    # Top-view raw points for stabilization step AFTER the loop.
+    # Each "run" is a list of (tx, ty) in top-view, corresponding to one
+    # continuous shot of the ball (separated by gaps with no detection).
+    topview_runs = []
+    current_run = []
+    gap_frames = 0
+    GAP_THRESHOLD = 15  # frames without ball to start a new run
+
+    # Reset video to the beginning (we have already read frame0 via read_first_frame)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     # ----------------------------------------------------------------------
@@ -177,15 +189,28 @@ def main():
             gray, floor_template, floor_bbox
         )
 
+        # Apply exponential smoothing to reduce jitter and small errors.
+        if frame_idx == 0:
+            dx_smooth = dx
+            dy_smooth = dy
+        else:
+            dx_smooth = alpha * dx_smooth + (1.0 - alpha) * dx
+            dy_smooth = alpha * dy_smooth + (1.0 - alpha) * dy
+
+        # Effective translations used everywhere.
+        dx_eff = dx_smooth
+        dy_eff = dy_smooth
+
         # --------------------------------------------------------------
-        # 3) CURRENT FLOOR MASK: warp floor_mask0 using (dx, dy)
+        # 3) CURRENT FLOOR MASK: warp floor_mask0 using (dx_eff, dy_eff)
         # --------------------------------------------------------------
-        floor_mask_curr = warp_floor_mask(floor_mask0, dx, dy, w, h)
+        floor_mask_curr = warp_floor_mask(floor_mask0, dx_eff, dy_eff, w, h)
 
         # Prepare frames for drawing:
         det_frame = frame.copy()
         traj_frame = frame.copy()
-        topview_frame = topview_accum.copy()
+        # For the top-view video we accumulate raw points directly on a copy.
+        topview_frame = topview_base.copy()
 
         # --------------------------------------------------------------
         # 4) RED BALL DETECTION CONSTRAINED TO FLOOR
@@ -201,6 +226,10 @@ def main():
         X_m = Y_m = Z_m = dist_m = None
         Vx = Vy = Vz = V = None
         est_3d = None
+
+        # Flag: did we get a valid top-view coordinate in this frame?
+        got_topview_point = False
+        topview_point = None  # (tx, ty) if available
 
         if ball is not None:
             bx, by, br = ball
@@ -259,30 +288,31 @@ def main():
             # ----------------------------------------------------------
             # 7) MAP BALL INTO FRAME0 COORDINATES AND THEN TOP-VIEW
             # ----------------------------------------------------------
-            # The camera moved by (dx, dy), so to map the current ball center
-            # back to frame0 coordinates we shift by +dx, +dy.
-            x_ref = int(round(bx + dx))
-            y_ref = int(round(by + dy))
+            # The camera moved by (dx_eff, dy_eff), so to map the current ball
+            # center back to frame0 coordinates we shift by +dx_eff, +dy_eff.
+            x_ref = int(round(bx + dx_eff))
+            y_ref = int(round(by + dy_eff))
 
             if (0 <= x_ref < w and 0 <= y_ref < h and
                     floor_mask0[y_ref, x_ref] > 0):
-                p0 = np.array([x_ref, y_ref, 1.0]).reshape(3, 1)
+                p0 = np.array([x_ref, y_ref, 1.0], dtype=np.float32).reshape(3, 1)
                 p_top = H0_to_top @ p0
                 if p_top[2, 0] != 0:
                     p_top /= p_top[2, 0]
                 tx, ty = int(p_top[0, 0]), int(p_top[1, 0])
 
                 if 0 <= tx < TOP_W and 0 <= ty < TOP_H:
-                    # Draw the ball trajectory in the 2D world map (top-view).
-                    cv2.circle(topview_accum, (tx, ty), 3, (0, 0, 255), -1)
+                    # For the raw top-view *video*, just draw the current point.
                     cv2.circle(topview_frame, (tx, ty), 3, (0, 0, 255), -1)
 
+                    # Save this point so that we can later straighten each run.
+                    got_topview_point = True
+                    topview_point = (tx, ty)
+
         # --------------------------------------------------------------
-        # 8) CAMERA POSITION IN TOP-VIEW
+        # 8) CAMERA POSITION IN TOP-VIEW (approximate)
         # --------------------------------------------------------------
-        # We consider the image center (cx, cy) plus the shift (dx, dy) as the
-        # camera position relative to frame0, then project it to the top-view.
-        cam_ref = np.array([cx + dx, cy + dy, 1.0]).reshape(3, 1)
+        cam_ref = np.array([cx + dx_eff, cy + dy_eff, 1.0], dtype=np.float32).reshape(3, 1)
         p_cam_top = H0_to_top @ cam_ref
         if p_cam_top[2, 0] != 0:
             p_cam_top /= p_cam_top[2, 0]
@@ -292,7 +322,22 @@ def main():
             cv2.circle(topview_frame, (cam_tx, cam_ty), 5, (255, 0, 0), 2)
 
         # --------------------------------------------------------------
-        # 9) CSV: 3D POSITION + 3D VELOCITY VS TIME
+        # 9) RUN MANAGEMENT FOR LATER STABILIZATION
+        # --------------------------------------------------------------
+        if got_topview_point:
+            # We have a ball detection and a valid top-view point
+            current_run.append(topview_point)
+            gap_frames = 0
+        else:
+            # No ball in this frame
+            gap_frames += 1
+            if gap_frames > GAP_THRESHOLD and len(current_run) > 0:
+                # End of current run, store it and start a new one.
+                topview_runs.append(current_run)
+                current_run = []
+
+        # --------------------------------------------------------------
+        # 10) CSV: 3D POSITION + 3D VELOCITY VS TIME
         # --------------------------------------------------------------
         def fmt(x):
             """Format floats as strings, leave empty if None."""
@@ -307,16 +352,15 @@ def main():
                 fmt(Vx), fmt(Vy), fmt(Vz), fmt(V),
             ])
         else:
-            # No valid ball detection or 3D estimate for this frame
             csv_writer.writerow([
                 frame_idx, f"{t_s:.4f}",
                 "", "", "",
-                "", "", "", "",    # X, Y, Z, distance
-                "", "", "", ""     # Vx, Vy, Vz, V
+                "", "", "", "",
+                "", "", "", ""
             ])
 
         # --------------------------------------------------------------
-        # 10) WRITE OUTPUT FRAMES TO VIDEOS
+        # 11) WRITE OUTPUT FRAMES TO VIDEOS
         # --------------------------------------------------------------
         det_writer.write(det_frame)
         traj_writer.write(traj_frame)
@@ -324,8 +368,59 @@ def main():
 
         frame_idx += 1
 
+    # If the video ended while a run was still active, store it as well.
+    if len(current_run) > 0:
+        topview_runs.append(current_run)
+
     # ----------------------------------------------------------------------
-    # CLEANUP
+    # 12) BUILD FINAL STABILIZED TOP-VIEW IMAGE
+    # ----------------------------------------------------------------------
+    topview_final = topview_base.copy()
+
+    print(f"[INFO] Number of ball runs detected: {len(topview_runs)}")
+
+    for run_idx, run_pts in enumerate(topview_runs):
+        if len(run_pts) == 0:
+            continue
+
+        pts = np.array(run_pts, dtype=np.float32)  # shape (N, 2)
+
+        # For very short runs, just draw points as-is (no reliable line).
+        if pts.shape[0] < 3:
+            for (tx, ty) in run_pts:
+                if 0 <= tx < TOP_W and 0 <= ty < TOP_H:
+                    cv2.circle(topview_final, (tx, ty), 3, (0, 0, 255), -1)
+            continue
+
+        # --- Fit a straight line using PCA ---
+        mean = pts.mean(axis=0)
+        pts_centered = pts - mean
+
+        # Covariance matrix (2x2) of the centered points
+        cov = (pts_centered.T @ pts_centered) / float(pts_centered.shape[0])
+
+        eigvals, eigvecs = np.linalg.eig(cov)
+        # Principal direction is the eigenvector with the largest eigenvalue
+        principal_dir = eigvecs[:, np.argmax(eigvals)].real
+        norm = np.linalg.norm(principal_dir)
+        if norm == 0:
+            principal_dir = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            principal_dir = principal_dir / norm
+
+        # Project each point onto the fitted line and draw it
+        for p in pts:
+            # Scalar projection length along principal_dir
+            proj_len = float(np.dot(p - mean, principal_dir))
+            p_proj = mean + proj_len * principal_dir
+            tx_s = int(round(p_proj[0]))
+            ty_s = int(round(p_proj[1]))
+
+            if 0 <= tx_s < TOP_W and 0 <= ty_s < TOP_H:
+                cv2.circle(topview_final, (tx_s, ty_s), 3, (0, 0, 255), -1)
+
+    # ----------------------------------------------------------------------
+    # 13) CLEANUP
     # ----------------------------------------------------------------------
     cap.release()
     det_writer.release()
@@ -333,11 +428,11 @@ def main():
     topview_writer.release()
     csv_file.close()
 
-    cv2.imwrite(OUTPUT_TOPVIEW_IMAGE, topview_accum)
-    print(f"[OK] Final top-view image saved to: {OUTPUT_TOPVIEW_IMAGE}")
+    cv2.imwrite(OUTPUT_TOPVIEW_IMAGE, topview_final)
+    print(f"[OK] Final stabilized top-view image saved to: {OUTPUT_TOPVIEW_IMAGE}")
     print(f"[OK] Detection video saved to: {OUTPUT_DET_VIDEO}")
     print(f"[OK] Trajectory video saved to: {OUTPUT_TRAJ_VIDEO}")
-    print(f"[OK] Top-view video saved to: {OUTPUT_TOPVIEW_VIDEO}")
+    print(f"[OK] Top-view video (raw) saved to: {OUTPUT_TOPVIEW_VIDEO}")
     print(f"[OK] CSV with 3D positions and velocities saved to: {OUTPUT_CSV}")
     print("[DONE] DotLumen pipeline completed successfully.")
 

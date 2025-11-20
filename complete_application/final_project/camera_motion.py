@@ -69,9 +69,8 @@ def track_camera(gray_frame, floor_template, floor_bbox):
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
     match_x, match_y = max_loc
 
-    # Note:
     # The floor template was originally at (x_min, y_min) in frame0.
-    # If we find it now at (match_x, match_y), the camera must have moved
+    # If we now find it at (match_x, match_y), the camera must have moved
     # by approximately:
     #   dx = x_min - match_x
     #   dy = y_min - match_y
